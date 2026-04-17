@@ -1,0 +1,862 @@
+/* ============================================================
+ * 永晃産業 注文書管理アプリ — メインコード
+ * ------------------------------------------------------------
+ * 【目次】 — Ctrl+F で見出しを検索してください
+ *   ■ 定数
+ *   ■ Webアプリ エントリポイント
+ *   ■ 注文の保存       (saveOrder / updateOrder / cancelOrder / restoreOrder)
+ *   ■ 注文の取得       (getOrder)
+ *   ■ 検索             (searchAll + TextFinder + クエリキャッシュ)
+ *   ■ 納品日登録       (updateDelivery)
+ *   ■ マスタ読み取り   (getMasters / getStatusList)
+ *   ■ 過去注文の取得   (getRecentOrders) — 複製ピッカー用
+ *   ■ ダッシュボード   (getDashboard)
+ *   ■ 監査ログ         (appendAuditLog_)
+ *   ■ シート/共通ヘルパ
+ *
+ * 【お客様メンテ用関数】 ※ Setup.gs にあります
+ *   - initSheets                  初回セットアップ
+ *   - seedDummyData               ダミーデータ投入
+ *   - importLegacyFromRawSheet    履歴.xlsxの取込
+ * ============================================================ */
+
+
+// ■ 定数 ====================================================
+
+const SHEET_ORDERS    = '注文明細';
+const SHEET_LEGACY    = '日計表';
+const SHEET_COUNTERS  = '採番管理';
+const SHEET_SUPPLIERS = '仕入先マスタ';
+const SHEET_PERSONS   = '担当者マスタ';
+const SHEET_ITEMS     = '品名マスタ';
+const SHEET_AUDIT     = '操作ログ';
+const SHEET_README    = '説明';
+
+const AUDIT_HEADER = ['日時', '操作者', '操作', '発注番号', '行番号', '項目', '旧値', '新値', '備考'];
+
+const AUDIT_ACTION = {
+  CREATE:   '作成',
+  UPDATE:   '編集',
+  CANCEL:   '取消',
+  RESTORE:  '復活',
+  DELIVERY: '納品日更新'
+};
+
+const SHEET_RENAMES = {
+  'orders': SHEET_ORDERS,
+  'legacy_daily': SHEET_LEGACY,
+  'counters': SHEET_COUNTERS
+};
+
+const ORDERS_HEADER = [
+  '発注番号', '行番号', '発注日', '仕入先名', '納期', '担当者',
+  '品名', '数量', '単価', '金額', '備考',
+  '用途', '社内メモ', '納品予定日', '入荷日', '仕上日', 'ステータス',
+  '作成日時', '更新日時'
+];
+const LEGACY_HEADER   = ['会社名', '品名', '数量', '入荷日', '仕上日', '備考'];
+const COUNTERS_HEADER = ['日付YYMMDD', '最終連番'];
+const SUPPLIER_HEADER = ['会社名', '敬称', '住所', 'TEL', 'FAX', '担当', '備考'];
+const PERSON_HEADER   = ['担当者名', '部署', '備考'];
+const ITEM_HEADER     = ['品名', '単位', '標準単価', 'よく使う仕入先', '備考'];
+
+const STATUS = {
+  ORDERED:   '発注済',
+  CONFIRMED: '納期回答済',
+  ARRIVED:   '入荷済',
+  DONE:      '完了',
+  CANCELED:  '取消'
+};
+const STATUS_LIST = [STATUS.ORDERED, STATUS.CONFIRMED, STATUS.ARRIVED, STATUS.DONE, STATUS.CANCELED];
+
+const PAGES = ['menu', 'new_order', 'order_pdf', 'search', 'delivery'];
+const APP_TEMPLATE = 'app';
+
+const SEARCH_CACHE_KEY_ORDERS = 'search_orders_v1';
+const SEARCH_CACHE_QUERY_PREFIX = 'qres_v1:';
+const SEARCH_CACHE_QUERY_INDEX_KEY = 'qres_v1_keys';
+const SEARCH_CACHE_TTL = 300;
+const SEARCH_RESULT_LIMIT = 200;
+
+
+// ■ Webアプリ エントリポイント =================================
+
+function doGet(e) {
+  const tmpl = HtmlService.createTemplateFromFile(APP_TEMPLATE);
+  tmpl.params = (e && e.parameter) || {};
+  tmpl.appUrl = ScriptApp.getService().getUrl();
+  return tmpl.evaluate()
+    .setTitle('永晃産業 発注管理')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function include(name) {
+  return HtmlService.createHtmlOutputFromFile(name).getContent();
+}
+
+function getWebAppUrl() {
+  return ScriptApp.getService().getUrl();
+}
+
+
+// ■ 注文の保存 ================================================
+
+function saveOrder(header, items) {
+  if (!items || items.length === 0) throw new Error('明細が空です');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const now = new Date();
+    const orderNumber = header.orderNumber && header.orderNumber.trim()
+      ? header.orderNumber.trim()
+      : generateOrderNumber_(now);
+    const orderDate = header.orderDate || formatDate_(now);
+    const rows = items.map(function(item, idx) {
+      return [
+        orderNumber, idx + 1, orderDate,
+        header.supplier || '', header.deliveryDate || '', header.person || '',
+        item.name || '', item.quantity || '', item.unitPrice || '', item.amount || '', item.note || '',
+        header.usage || '', header.internalMemo || '',
+        '', '', '', STATUS.ORDERED,
+        now, now
+      ];
+    });
+    const sh = getOrdersSheet_();
+    sh.getRange(sh.getLastRow() + 1, 1, rows.length, ORDERS_HEADER.length).setValues(rows);
+    appendAuditLog_(AUDIT_ACTION.CREATE, orderNumber, '', '',
+      '', items.length + '明細', header.supplier || '');
+    invalidateSearchCache_();
+    return { orderNumber: orderNumber, rowCount: rows.length };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 既存注文を編集する。orderNumber 行を全削除→新内容で再書込。
+ * 既存の作成日時・採番は維持、変更点を操作ログに記録。
+ */
+function updateOrder(orderNumber, header, items) {
+  if (!orderNumber) throw new Error('発注番号が指定されていません');
+  if (!items || items.length === 0) throw new Error('明細が空です');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sh = getOrdersSheet_();
+    const data = sh.getDataRange().getValues();
+    const col = headerIndex_(data[0]);
+    const targetRows = [];
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][col.orderNumber]) === String(orderNumber)) targetRows.push(i);
+    }
+    if (targetRows.length === 0) throw new Error('対象の発注番号が見つかりません: ' + orderNumber);
+
+    const oldFirst = data[targetRows[0]];
+    const createdAt = oldFirst[col.createdAt] || new Date();
+    const oldOrderDate = formatCellDate_(oldFirst[col.orderDate]) || formatDate_(new Date());
+    const oldSupplier = oldFirst[col.supplier];
+    const oldDeliveryDate = oldFirst[col.deliveryDate];
+    const oldPerson = oldFirst[col.person];
+    const oldUsage = oldFirst[col.usage];
+    const oldMemo = oldFirst[col.internalMemo];
+    // 既存の納品予定日／入荷日／仕上日／ステータスは行番号で引き継ぐ
+    const carryByLine = {};
+    targetRows.forEach(function(i) {
+      const row = data[i];
+      carryByLine[Number(row[col.lineNumber])] = {
+        plannedDelivery: row[col.plannedDelivery],
+        arrivalDate: row[col.arrivalDate],
+        finishDate: row[col.finishDate],
+        status: row[col.status]
+      };
+    });
+
+    const now = new Date();
+    const supplier = header.supplier !== undefined ? header.supplier : oldSupplier;
+    const deliveryDate = header.deliveryDate !== undefined ? header.deliveryDate : oldDeliveryDate;
+    const person = header.person !== undefined ? header.person : oldPerson;
+    const usage = header.usage !== undefined ? header.usage : oldUsage;
+    const memo = header.internalMemo !== undefined ? header.internalMemo : oldMemo;
+    const orderDate = header.orderDate || oldOrderDate;
+
+    const newRows = items.map(function(item, idx) {
+      const lineNum = idx + 1;
+      const carry = carryByLine[lineNum] || { plannedDelivery: '', arrivalDate: '', finishDate: '', status: STATUS.ORDERED };
+      return [
+        orderNumber, lineNum, orderDate,
+        supplier, deliveryDate, person,
+        item.name || '', item.quantity || '', item.unitPrice || '', item.amount || '', item.note || '',
+        usage, memo,
+        carry.plannedDelivery, carry.arrivalDate, carry.finishDate, carry.status,
+        createdAt, now
+      ];
+    });
+
+    // 既存行を下から削除
+    targetRows.slice().reverse().forEach(function(i) { sh.deleteRow(i + 1); });
+    sh.getRange(sh.getLastRow() + 1, 1, newRows.length, ORDERS_HEADER.length).setValues(newRows);
+
+    // 変更ログ
+    if (oldSupplier !== supplier) appendAuditLog_(AUDIT_ACTION.UPDATE, orderNumber, '', '仕入先名', oldSupplier, supplier, '');
+    if (oldDeliveryDate !== deliveryDate) appendAuditLog_(AUDIT_ACTION.UPDATE, orderNumber, '', '納期', oldDeliveryDate, deliveryDate, '');
+    if (oldPerson !== person) appendAuditLog_(AUDIT_ACTION.UPDATE, orderNumber, '', '担当者', oldPerson, person, '');
+    if (oldUsage !== usage) appendAuditLog_(AUDIT_ACTION.UPDATE, orderNumber, '', '用途', oldUsage, usage, '');
+    if (oldMemo !== memo) appendAuditLog_(AUDIT_ACTION.UPDATE, orderNumber, '', '社内メモ', oldMemo, memo, '');
+    appendAuditLog_(AUDIT_ACTION.UPDATE, orderNumber, '', '明細', targetRows.length + '行', newRows.length + '行', '内容更新');
+
+    invalidateSearchCache_();
+    return { orderNumber: orderNumber, rowCount: newRows.length };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** 発注を取消（全行のステータスを「取消」に） */
+function cancelOrder(orderNumber, reason) {
+  return setOrderStatus_(orderNumber, STATUS.CANCELED, AUDIT_ACTION.CANCEL, reason || '');
+}
+
+/** 取消を解除（全行のステータスを「発注済」に戻す） */
+function restoreOrder(orderNumber) {
+  return setOrderStatus_(orderNumber, STATUS.ORDERED, AUDIT_ACTION.RESTORE, '');
+}
+
+function setOrderStatus_(orderNumber, newStatus, action, note) {
+  if (!orderNumber) throw new Error('発注番号が指定されていません');
+  const sh = getOrdersSheet_();
+  const data = sh.getDataRange().getValues();
+  const col = headerIndex_(data[0]);
+  const now = new Date();
+  let updated = 0;
+  let oldStatus = '';
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][col.orderNumber]) !== String(orderNumber)) continue;
+    if (!oldStatus) oldStatus = data[i][col.status];
+    const row = data[i].slice();
+    row[col.status] = newStatus;
+    row[col.updatedAt] = now;
+    sh.getRange(i + 1, 1, 1, row.length).setValues([row]);
+    updated++;
+  }
+  if (updated === 0) throw new Error('対象の発注番号が見つかりません: ' + orderNumber);
+  appendAuditLog_(action, orderNumber, '', 'ステータス', oldStatus, newStatus, note);
+  invalidateSearchCache_();
+  return { updated: updated };
+}
+
+function generateOrderNumber_(date) {
+  const yymmdd = formatYymmdd_(date);
+  const sh = getCountersSheet_();
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === yymmdd) {
+      const next = Number(data[i][1]) + 1;
+      sh.getRange(i + 1, 2).setValue(next);
+      return yymmdd + pad3_(next);
+    }
+  }
+  sh.appendRow([yymmdd, 1]);
+  return yymmdd + '001';
+}
+
+
+// ■ 注文の取得 ================================================
+
+function getOrder(orderNumber) {
+  const sh = getOrdersSheet_();
+  const data = sh.getDataRange().getValues();
+  const col = headerIndex_(data[0]);
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][col.orderNumber]) === String(orderNumber)) {
+      rows.push(rowToOrderItem_(data[i], col));
+    }
+  }
+  if (rows.length === 0) return null;
+  rows.sort(function(a, b) { return a.lineNumber - b.lineNumber; });
+  const h = rows[0];
+  return {
+    orderNumber: h.orderNumber, orderDate: h.orderDate,
+    supplier: h.supplier, deliveryDate: h.deliveryDate, person: h.person,
+    usage: h.usage, internalMemo: h.internalMemo,
+    items: rows
+  };
+}
+
+
+// ■ 検索 =====================================================
+
+function searchAll(query) {
+  const q = normalizeQuery_(query);
+  const cache = CacheService.getScriptCache();
+  const cacheKey = SEARCH_CACHE_QUERY_PREFIX + simpleHash_(JSON.stringify(q));
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) { /* fallthrough */ }
+  }
+
+  const text = q.text;
+  const source = q.source;
+  const rowsBase = [];
+
+  if (source === 'orders' || source === 'both') {
+    Array.prototype.push.apply(rowsBase, loadOrdersCached_());
+  }
+  if (source === 'legacy' || source === 'both') {
+    if (text) {
+      Array.prototype.push.apply(rowsBase, searchLegacyByText_(text, SEARCH_RESULT_LIMIT * 2));
+    } else {
+      Array.prototype.push.apply(rowsBase, readLegacyForSearch_());
+    }
+  }
+
+  const hits = [];
+  for (let i = 0; i < rowsBase.length; i++) {
+    const r = rowsBase[i];
+    if (text && !matchesText_(r, text)) continue;
+    if (q.supplier && String(r.supplier).indexOf(q.supplier) < 0) continue;
+    if (q.status && r.status !== q.status) continue;
+    if (q.usage && String(r.usage || '').indexOf(q.usage) < 0) continue;
+    if (!withinRange_(r, q.dateFrom, q.dateTo)) continue;
+    if (q.preset && !matchesPreset_(r, q.preset)) continue;
+    hits.push(r);
+    if (hits.length >= SEARCH_RESULT_LIMIT) break;
+  }
+  const result = { total: hits.length, limit: SEARCH_RESULT_LIMIT, rows: hits };
+  try {
+    const json = JSON.stringify(result);
+    if (json.length < 95000) {
+      cache.put(cacheKey, json, SEARCH_CACHE_TTL);
+      pushQueryCacheKey_(cacheKey);
+    }
+  } catch (e) { /* skip */ }
+  return result;
+}
+
+function normalizeQuery_(query) {
+  const q = query || {};
+  return {
+    text: (q.text || '').trim(),
+    supplier: (q.supplier || '').trim(),
+    status: (q.status || '').trim(),
+    usage: (q.usage || '').trim(),
+    dateFrom: q.dateFrom || '',
+    dateTo: q.dateTo || '',
+    source: q.source || 'both',
+    preset: q.preset || ''
+  };
+}
+
+function matchesPreset_(r, preset) {
+  if (preset === 'overdue') {
+    const today = formatDate_(new Date());
+    return r.source === 'orders' && r.plannedDelivery && r.plannedDelivery < today &&
+      (r.status === STATUS.ORDERED || r.status === STATUS.CONFIRMED);
+  }
+  if (preset === 'this_week') {
+    const today = new Date();
+    const todayStr = formatDate_(today);
+    const wkEnd = new Date(today.getTime() + 7 * 86400000);
+    const wkEndStr = formatDate_(wkEnd);
+    return r.source === 'orders' && r.plannedDelivery && r.plannedDelivery >= todayStr && r.plannedDelivery <= wkEndStr &&
+      r.status !== STATUS.DONE && r.status !== STATUS.CANCELED;
+  }
+  if (preset === 'today_finish') {
+    const today = formatDate_(new Date());
+    return r.source === 'orders' && r.finishDate === today;
+  }
+  return true;
+}
+
+/** legacyシートを TextFinder で前段絞り込みして返す。textは必須。 */
+function searchLegacyByText_(text, hardLimit) {
+  const sh = getLegacySheet_();
+  if (!sh || sh.getLastRow() < 2) return [];
+  const finder = sh.createTextFinder(text).matchEntireCell(false).matchCase(false);
+  const matches = finder.findAll();
+  if (matches.length === 0) return [];
+  const rowSet = {};
+  for (let i = 0; i < matches.length; i++) {
+    const r = matches[i].getRow();
+    if (r === 1) continue;
+    rowSet[r] = true;
+    if (Object.keys(rowSet).length >= hardLimit) break;
+  }
+  const rowNums = Object.keys(rowSet).map(Number).sort(function(a, b) { return a - b; });
+  if (rowNums.length === 0) return [];
+  // ヒット行のみ取得（連続性は無視、1行ずつ getValues すると遅いので一括レンジで取って後で絞る）
+  const minR = rowNums[0];
+  const maxR = rowNums[rowNums.length - 1];
+  const block = sh.getRange(minR, 1, maxR - minR + 1, LEGACY_HEADER.length).getValues();
+  const header = sh.getRange(1, 1, 1, LEGACY_HEADER.length).getValues()[0];
+  const idx = {
+    company: header.indexOf('会社名'),
+    name: header.indexOf('品名'),
+    quantity: header.indexOf('数量'),
+    arrival: header.indexOf('入荷日'),
+    finish: header.indexOf('仕上日'),
+    note: header.indexOf('備考')
+  };
+  const out = [];
+  for (let k = 0; k < rowNums.length; k++) {
+    const r = rowNums[k] - minR;
+    const row = block[r];
+    out.push({
+      source: 'legacy',
+      orderNumber: '',
+      supplier: row[idx.company],
+      name: row[idx.name],
+      quantity: row[idx.quantity],
+      note: row[idx.note],
+      arrivalDate: formatCellDate_(row[idx.arrival]),
+      finishDate: formatCellDate_(row[idx.finish]),
+      status: ''
+    });
+  }
+  return out;
+}
+
+function pushQueryCacheKey_(key) {
+  const cache = CacheService.getScriptCache();
+  const idx = cache.get(SEARCH_CACHE_QUERY_INDEX_KEY);
+  let arr = [];
+  if (idx) try { arr = JSON.parse(idx); } catch (e) { arr = []; }
+  if (arr.indexOf(key) < 0) arr.push(key);
+  if (arr.length > 200) arr = arr.slice(-200);
+  cache.put(SEARCH_CACHE_QUERY_INDEX_KEY, JSON.stringify(arr), SEARCH_CACHE_TTL);
+}
+
+function clearQueryCache_() {
+  const cache = CacheService.getScriptCache();
+  const idx = cache.get(SEARCH_CACHE_QUERY_INDEX_KEY);
+  if (!idx) return;
+  try {
+    const arr = JSON.parse(idx);
+    if (arr.length) cache.removeAll(arr);
+  } catch (e) { /* skip */ }
+  cache.remove(SEARCH_CACHE_QUERY_INDEX_KEY);
+}
+
+function simpleHash_(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h) + str.charCodeAt(i);
+    h |= 0;
+  }
+  return h.toString(36);
+}
+
+function matchesText_(r, text) {
+  const needle = text.toLowerCase();
+  const hay = [r.orderNumber, r.supplier, r.name, r.note, r.usage, r.internalMemo]
+    .map(function(x) { return String(x || '').toLowerCase(); }).join(' ');
+  return hay.indexOf(needle) >= 0;
+}
+
+function withinRange_(r, from, to) {
+  if (!from && !to) return true;
+  const d = r.orderDate || r.arrivalDate || '';
+  if (from && d < from) return false;
+  if (to && d > to) return false;
+  return true;
+}
+
+function loadOrdersCached_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(SEARCH_CACHE_KEY_ORDERS);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) { /* fallthrough */ }
+  }
+  const rows = readOrdersForSearch_();
+  try {
+    const json = JSON.stringify(rows);
+    if (json.length < 95000) cache.put(SEARCH_CACHE_KEY_ORDERS, json, SEARCH_CACHE_TTL);
+  } catch (e) { /* 100KB超はキャッシュしない */ }
+  return rows;
+}
+
+function invalidateSearchCache_() {
+  CacheService.getScriptCache().remove(SEARCH_CACHE_KEY_ORDERS);
+  clearQueryCache_();
+}
+
+function readOrdersForSearch_() {
+  const sh = getOrdersSheet_();
+  if (!sh || sh.getLastRow() < 2) return [];
+  const data = sh.getDataRange().getValues();
+  const col = headerIndex_(data[0]);
+  const out = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    out.push({
+      source: 'orders',
+      orderNumber: String(row[col.orderNumber] || ''),
+      lineNumber: row[col.lineNumber],
+      orderDate: formatCellDate_(row[col.orderDate]),
+      supplier: row[col.supplier],
+      deliveryDate: row[col.deliveryDate],
+      person: row[col.person],
+      name: row[col.name],
+      quantity: row[col.quantity],
+      note: row[col.note],
+      usage: row[col.usage],
+      internalMemo: row[col.internalMemo],
+      plannedDelivery: formatCellDate_(row[col.plannedDelivery]),
+      arrivalDate: formatCellDate_(row[col.arrivalDate]),
+      finishDate: formatCellDate_(row[col.finishDate]),
+      status: row[col.status]
+    });
+  }
+  return out;
+}
+
+function readLegacyForSearch_() {
+  const sh = getLegacySheet_();
+  if (!sh || sh.getLastRow() < 2) return [];
+  const data = sh.getDataRange().getValues();
+  const header = data[0];
+  const idx = {
+    company: header.indexOf('会社名'),
+    name: header.indexOf('品名'),
+    quantity: header.indexOf('数量'),
+    arrival: header.indexOf('入荷日'),
+    finish: header.indexOf('仕上日'),
+    note: header.indexOf('備考')
+  };
+  const out = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    out.push({
+      source: 'legacy',
+      orderNumber: '',
+      supplier: row[idx.company],
+      name: row[idx.name],
+      quantity: row[idx.quantity],
+      note: row[idx.note],
+      arrivalDate: formatCellDate_(row[idx.arrival]),
+      finishDate: formatCellDate_(row[idx.finish]),
+      status: ''
+    });
+  }
+  return out;
+}
+
+/**
+ * 日計表シートで会社名が空の行に直前の会社名を前方埋めする。
+ * 履歴.xlsx を直接コピー＆ペーストした場合の補正用。importLegacyFromRawSheet 経由なら不要。
+ */
+function normalizeLegacy() {
+  const sh = getLegacySheet_();
+  if (!sh || sh.getLastRow() < 2) return;
+  const range = sh.getRange(2, 1, sh.getLastRow() - 1, 1);
+  const values = range.getValues();
+  let carry = '';
+  for (let i = 0; i < values.length; i++) {
+    const v = String(values[i][0] || '').trim();
+    if (v) carry = v;
+    else values[i][0] = carry;
+  }
+  range.setValues(values);
+  invalidateSearchCache_();
+}
+
+
+// ■ 納品日登録 ================================================
+
+function updateDelivery(payload) {
+  const p = payload || {};
+  if (!p.orderNumber) throw new Error('発注番号が指定されていません');
+  const sh = getOrdersSheet_();
+  const data = sh.getDataRange().getValues();
+  const col = headerIndex_(data[0]);
+  const targetLine = p.lineNumber ? Number(p.lineNumber) : null;
+  const rowsUpdated = [];
+  const changes = [];
+  const now = new Date();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][col.orderNumber]) !== String(p.orderNumber)) continue;
+    if (targetLine && Number(data[i][col.lineNumber]) !== targetLine) continue;
+    const row = data[i];
+    const before = { plannedDelivery: row[col.plannedDelivery], arrivalDate: row[col.arrivalDate], finishDate: row[col.finishDate], status: row[col.status] };
+    if (p.plannedDelivery !== undefined) row[col.plannedDelivery] = p.plannedDelivery;
+    if (p.arrivalDate !== undefined) row[col.arrivalDate] = p.arrivalDate;
+    if (p.finishDate !== undefined) row[col.finishDate] = p.finishDate;
+    row[col.status] = nextStatus_(p, row[col.status]);
+    row[col.updatedAt] = now;
+    sh.getRange(i + 1, 1, 1, row.length).setValues([row]);
+    rowsUpdated.push(row[col.lineNumber]);
+    changes.push({ line: row[col.lineNumber], before: before, after: { plannedDelivery: row[col.plannedDelivery], arrivalDate: row[col.arrivalDate], finishDate: row[col.finishDate], status: row[col.status] } });
+  }
+  if (rowsUpdated.length === 0) throw new Error('該当行が見つかりません');
+  changes.forEach(function(c) {
+    ['plannedDelivery', 'arrivalDate', 'finishDate', 'status'].forEach(function(k) {
+      if (formatCellDate_(c.before[k]) !== formatCellDate_(c.after[k])) {
+        const labels = { plannedDelivery: '納品予定日', arrivalDate: '入荷日', finishDate: '仕上日', status: 'ステータス' };
+        appendAuditLog_(AUDIT_ACTION.DELIVERY, p.orderNumber, c.line, labels[k], formatCellDate_(c.before[k]), formatCellDate_(c.after[k]), '');
+      }
+    });
+  });
+  invalidateSearchCache_();
+  return { updated: rowsUpdated.length };
+}
+
+function nextStatus_(p, current) {
+  if (p.status) return p.status;
+  if (p.finishDate) return STATUS.DONE;
+  if (p.arrivalDate) return STATUS.ARRIVED;
+  if (p.plannedDelivery) return STATUS.CONFIRMED;
+  return current;
+}
+
+
+// ■ マスタ読み取り ============================================
+
+function getMasters() {
+  return {
+    suppliers: readSuppliers_(),
+    persons: readPersons_(),
+    items: readItems_()
+  };
+}
+
+function getStatusList() { return STATUS_LIST; }
+
+
+// ■ 過去注文の取得（複製用） =================================
+
+/** 直近の発注ヘッダ要約（複製ピッカー用）。limit件、新しい順。 */
+function getRecentOrders(limit) {
+  const lim = limit || 50;
+  const sh = getOrdersSheet_();
+  if (!sh || sh.getLastRow() < 2) return [];
+  const data = sh.getDataRange().getValues();
+  const col = headerIndex_(data[0]);
+  // orderNumberごとに集約しつつ、最新行 (createdAt の降順) を採用
+  const byOrder = {};
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const n = String(row[col.orderNumber]);
+    if (!byOrder[n]) byOrder[n] = { orderNumber: n, orderDate: formatCellDate_(row[col.orderDate]), supplier: row[col.supplier], person: row[col.person], usage: row[col.usage], itemCount: 0, createdAt: row[col.createdAt], status: row[col.status] };
+    byOrder[n].itemCount++;
+  }
+  const arr = Object.keys(byOrder).map(function(k) { return byOrder[k]; });
+  arr.sort(function(a, b) {
+    const ta = a.createdAt instanceof Date ? a.createdAt.getTime() : 0;
+    const tb = b.createdAt instanceof Date ? b.createdAt.getTime() : 0;
+    return tb - ta;
+  });
+  return arr.slice(0, lim).map(function(o) { delete o.createdAt; return o; });
+}
+
+
+// ■ ダッシュボード ============================================
+
+function getDashboard() {
+  const sh = getOrdersSheet_();
+  if (!sh || sh.getLastRow() < 2) {
+    return { overdue: { count: 0 }, thisWeek: { count: 0 }, todayFinish: { count: 0 }, projects: [] };
+  }
+  const data = sh.getDataRange().getValues();
+  const col = headerIndex_(data[0]);
+  const today = formatDate_(new Date());
+  const wkEnd = formatDate_(new Date(Date.now() + 7 * 86400000));
+  let overdue = 0, thisWeek = 0, todayFinish = 0;
+  const projects = {};
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const status = row[col.status];
+    if (status === STATUS.CANCELED) continue;
+    const planned = formatCellDate_(row[col.plannedDelivery]);
+    const finish = formatCellDate_(row[col.finishDate]);
+    if (planned && planned < today && (status === STATUS.ORDERED || status === STATUS.CONFIRMED)) overdue++;
+    if (planned && planned >= today && planned <= wkEnd && status !== STATUS.DONE) thisWeek++;
+    if (finish === today) todayFinish++;
+    const usage = String(row[col.usage] || '').trim();
+    if (usage && status !== STATUS.DONE) {
+      if (!projects[usage]) projects[usage] = { usage: usage, total: 0, byStatus: {} };
+      projects[usage].total++;
+      projects[usage].byStatus[status] = (projects[usage].byStatus[status] || 0) + 1;
+    }
+  }
+  return {
+    overdue: { count: overdue },
+    thisWeek: { count: thisWeek },
+    todayFinish: { count: todayFinish },
+    projects: Object.keys(projects).map(function(k) { return projects[k]; })
+      .sort(function(a, b) { return b.total - a.total; }).slice(0, 10)
+  };
+}
+
+
+// ■ 監査ログ ==================================================
+
+function appendAuditLog_(action, orderNumber, lineNumber, field, oldValue, newValue, note) {
+  const sh = getAuditLogSheet_();
+  if (!sh) return;
+  let user = '';
+  try { user = Session.getActiveUser().getEmail() || ''; } catch (e) { user = ''; }
+  sh.appendRow([
+    new Date(), user, action,
+    orderNumber || '', lineNumber || '',
+    field || '',
+    oldValue == null ? '' : String(oldValue),
+    newValue == null ? '' : String(newValue),
+    note || ''
+  ]);
+}
+
+function readSuppliers_() {
+  const sh = getSuppliersSheet_();
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, SUPPLIER_HEADER.length).getValues()
+    .filter(function(r) { return String(r[0] || '').trim(); })
+    .map(function(r) {
+      return { name: r[0], honorific: r[1] || '御中', address: r[2], tel: r[3], fax: r[4], person: r[5], note: r[6] };
+    });
+}
+
+function readPersons_() {
+  const sh = getPersonsSheet_();
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, PERSON_HEADER.length).getValues()
+    .filter(function(r) { return String(r[0] || '').trim(); })
+    .map(function(r) { return { name: r[0], dept: r[1], note: r[2] }; });
+}
+
+function readItems_() {
+  const sh = getItemsSheet_();
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, ITEM_HEADER.length).getValues()
+    .filter(function(r) { return String(r[0] || '').trim(); })
+    .map(function(r) { return { name: r[0], unit: r[1], unitPrice: r[2], supplier: r[3], note: r[4] }; });
+}
+
+/**
+ * 新規の仕入先名/担当者名/品名をマスタへ追加する。
+ * payload = { suppliers: ['ABC'], persons: ['山田'], items: ['新部品'] }
+ * 既存と重複するものはスキップ。
+ */
+function addToMasters(payload) {
+  const p = payload || {};
+  const result = { suppliers: 0, persons: 0, items: 0 };
+
+  const supSh = getSuppliersSheet_();
+  if (supSh && p.suppliers && p.suppliers.length) {
+    const existing = readSuppliers_().reduce(function(s, x) { s[x.name] = true; return s; }, {});
+    const fresh = p.suppliers.filter(function(n) { return n && !existing[n]; });
+    if (fresh.length) {
+      const rows = fresh.map(function(n) { return [n, '御中', '', '', '', '', '']; });
+      supSh.getRange(supSh.getLastRow() + 1, 1, rows.length, SUPPLIER_HEADER.length).setValues(rows);
+      result.suppliers = rows.length;
+    }
+  }
+  const pSh = getPersonsSheet_();
+  if (pSh && p.persons && p.persons.length) {
+    const existing = readPersons_().reduce(function(s, x) { s[x.name] = true; return s; }, {});
+    const fresh = p.persons.filter(function(n) { return n && !existing[n]; });
+    if (fresh.length) {
+      const rows = fresh.map(function(n) { return [n, '', '']; });
+      pSh.getRange(pSh.getLastRow() + 1, 1, rows.length, PERSON_HEADER.length).setValues(rows);
+      result.persons = rows.length;
+    }
+  }
+  const iSh = getItemsSheet_();
+  if (iSh && p.items && p.items.length) {
+    const existing = readItems_().reduce(function(s, x) { s[x.name] = true; return s; }, {});
+    const fresh = [];
+    const seen = {};
+    p.items.forEach(function(n) { if (n && !existing[n] && !seen[n]) { seen[n] = true; fresh.push(n); } });
+    if (fresh.length) {
+      const rows = fresh.map(function(n) { return [n, '', '', '', '']; });
+      iSh.getRange(iSh.getLastRow() + 1, 1, rows.length, ITEM_HEADER.length).setValues(rows);
+      result.items = rows.length;
+    }
+  }
+  return result;
+}
+
+
+// ■ シート/共通ヘルパ =========================================
+
+/**
+ * 操作対象のスプレッドシートを返す。
+ * 1) スクリプトがスプシにバインドされていれば getActive を返す
+ * 2) スタンドアロンなら ScriptProperties の SPREADSHEET_ID で openById
+ */
+function getSS_() {
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active) return active;
+  const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (!id) throw new Error(
+    'スプレッドシートが特定できません。\n' +
+    'Apps Scriptエディタで setSpreadsheetId("スプシのID") を一度だけ実行してください。'
+  );
+  return SpreadsheetApp.openById(id);
+}
+
+function getOrdersSheet_()    { return getSS_().getSheetByName(SHEET_ORDERS); }
+function getLegacySheet_()    { return getSS_().getSheetByName(SHEET_LEGACY); }
+function getCountersSheet_()  { return getSS_().getSheetByName(SHEET_COUNTERS); }
+function getSuppliersSheet_() { return getSS_().getSheetByName(SHEET_SUPPLIERS); }
+function getPersonsSheet_()   { return getSS_().getSheetByName(SHEET_PERSONS); }
+function getItemsSheet_()     { return getSS_().getSheetByName(SHEET_ITEMS); }
+function getAuditLogSheet_()  { return getSS_().getSheetByName(SHEET_AUDIT); }
+
+function headerIndex_(header) {
+  return {
+    orderNumber: header.indexOf('発注番号'),
+    lineNumber: header.indexOf('行番号'),
+    orderDate: header.indexOf('発注日'),
+    supplier: header.indexOf('仕入先名'),
+    deliveryDate: header.indexOf('納期'),
+    person: header.indexOf('担当者'),
+    name: header.indexOf('品名'),
+    quantity: header.indexOf('数量'),
+    unitPrice: header.indexOf('単価'),
+    amount: header.indexOf('金額'),
+    note: header.indexOf('備考'),
+    usage: header.indexOf('用途'),
+    internalMemo: header.indexOf('社内メモ'),
+    plannedDelivery: header.indexOf('納品予定日'),
+    arrivalDate: header.indexOf('入荷日'),
+    finishDate: header.indexOf('仕上日'),
+    status: header.indexOf('ステータス'),
+    createdAt: header.indexOf('作成日時'),
+    updatedAt: header.indexOf('更新日時')
+  };
+}
+
+function rowToOrderItem_(row, col) {
+  return {
+    orderNumber: row[col.orderNumber],
+    lineNumber: row[col.lineNumber],
+    orderDate: formatCellDate_(row[col.orderDate]),
+    supplier: row[col.supplier],
+    deliveryDate: row[col.deliveryDate],
+    person: row[col.person],
+    name: row[col.name],
+    quantity: row[col.quantity],
+    unitPrice: row[col.unitPrice],
+    amount: row[col.amount],
+    note: row[col.note],
+    usage: row[col.usage],
+    internalMemo: row[col.internalMemo],
+    plannedDelivery: formatCellDate_(row[col.plannedDelivery]),
+    arrivalDate: formatCellDate_(row[col.arrivalDate]),
+    finishDate: formatCellDate_(row[col.finishDate]),
+    status: row[col.status]
+  };
+}
+
+function formatCellDate_(v) {
+  if (v === '' || v === null || v === undefined) return '';
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    return Utilities.formatDate(v, 'Asia/Tokyo', 'yyyy-MM-dd');
+  }
+  return String(v);
+}
+
+function formatYymmdd_(date) { return Utilities.formatDate(date, 'Asia/Tokyo', 'yyMMdd'); }
+function formatDate_(date)   { return Utilities.formatDate(date, 'Asia/Tokyo', 'yyyy-MM-dd'); }
+function pad3_(n)            { return ('000' + n).slice(-3); }
